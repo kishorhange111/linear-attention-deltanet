@@ -8,6 +8,10 @@ Mixer details, following the papers' stable choices:
 - DeltaNet: q and k L2-normalised (needed so I − β k kᵀ is a contraction), and a learning
   rate β_t = σ(w·x_t) ∈ (0, 1) per head and token.
 Each recurrent mixer's output goes through a per-head RMSNorm before the output projection.
+
+``conv > 0`` adds a short causal depthwise convolution (then SiLU) on q, k and v, as in
+DeltaNet, GLA and Mamba. Without it a recurrent layer has no cheap way to bind a token to its
+neighbour, and in MQAR the value sits one position after its key.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ class Config:
     ctx: int = 256
     mixer: str = "deltanet"  # softmax | linear | gated | deltanet
     chunk: int = 16
+    conv: int = 0  # short causal depthwise conv width on q, k, v; 0 = off
 
 
 class Mixer(nn.Module):
@@ -41,10 +46,18 @@ class Mixer(nn.Module):
         if c.mixer in ("gated", "deltanet"):
             self.gate = nn.Linear(c.d, c.heads)
         self.norm = nn.RMSNorm(self.hd) if c.mixer != "softmax" else None
+        self.conv = (
+            nn.Conv1d(3 * c.d, 3 * c.d, c.conv, groups=3 * c.d, padding=c.conv - 1)
+            if c.conv
+            else None
+        )
 
     def forward(self, x):
         b, L, d = x.shape
-        q, k, v = self.qkv(x).view(b, L, 3, self.h, self.hd).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x)
+        if self.conv is not None:  # left context only: keep the first L outputs
+            qkv = F.silu(self.conv(qkv.transpose(1, 2))[..., :L].transpose(1, 2))
+        q, k, v = qkv.view(b, L, 3, self.h, self.hd).permute(2, 0, 3, 1, 4)
         m = self.c.mixer
         if m == "softmax":
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
