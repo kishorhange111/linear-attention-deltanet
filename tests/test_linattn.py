@@ -85,10 +85,11 @@ def test_delta_state_stays_bounded_with_normalised_keys():
     assert S.norm() < 10 < S_lin.norm()
 
 
+@pytest.mark.parametrize("conv", [0, 4])
 @pytest.mark.parametrize("mixer", ["softmax", "linear", "gated", "deltanet"])
-def test_models_are_causal_and_train(mixer):
+def test_models_are_causal_and_train(mixer, conv):
     torch.manual_seed(0)
-    m = LM(Config(d=32, heads=2, layers=1, ctx=40, mixer=mixer, chunk=8))
+    m = LM(Config(d=32, heads=2, layers=1, ctx=40, mixer=mixer, chunk=8, conv=conv))
     x = torch.randint(0, 256, (2, 40))
     y = m(x)
     x2 = x.clone()
@@ -115,9 +116,12 @@ def test_train_script_runs_and_resumes(tmp_path):
         "0",
         "--steps",
         "3",
+        "--conv",
+        "4",
     ]
     main(args)
     main(args)
     rows = [json.loads(s) for s in (tmp_path / "runs.jsonl").read_text().splitlines()]
     assert [r["mixer"] for r in rows] == ["deltanet", "linear"]
-    assert "deltanet" in (tmp_path / "summary.md").read_text()
+    assert all(r["conv"] == 4 for r in rows)
+    assert "deltanet+conv4" in (tmp_path / "summary.md").read_text()

@@ -41,13 +41,30 @@ def mqar_batch(bs, K, gen, device):
     return x.to(device), y.to(device)
 
 
-def run(mixer, K, steps, device, bs=64, lr=1e-3, seed=0, d=128):
+def accuracy(model, K, seed, device, batches=8):
+    eg = torch.Generator().manual_seed(10_000 + seed)
+    correct = total = 0
+    with torch.no_grad():
+        for _ in range(batches):
+            x, y = mqar_batch(256, K, eg, device)
+            pred = model(x).argmax(-1)
+            m = y != -100
+            correct += int((pred[m] == y[m]).sum())
+            total += int(m.sum())
+    return correct / total
+
+
+def label(r) -> str:
+    return r["mixer"] + (f"+conv{r['conv']}" if r.get("conv") else "")
+
+
+def run(mixer, K, steps, device, bs=64, lr=1e-3, seed=0, d=128, conv=0, curve_every=1000):
     torch.manual_seed(seed)
     gen = torch.Generator().manual_seed(seed)
-    cfg = Config(d=d, mixer=mixer, ctx=4 * K)
+    cfg = Config(d=d, mixer=mixer, ctx=4 * K, conv=conv)
     model = LM(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
-    t0 = time.time()
+    t0, curve, eval_sec = time.time(), [], 0.0
     for step in range(1, steps + 1):
         for g in opt.param_groups:
             g["lr"] = lr * min(1.0, step / 200) * 0.5 * (1 + math.cos(math.pi * step / steps))
@@ -57,25 +74,25 @@ def run(mixer, K, steps, device, bs=64, lr=1e-3, seed=0, d=128):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        if curve_every and step % curve_every == 0 and step < steps:
+            te = time.time()
+            model.eval()
+            curve.append([step, round(accuracy(model, K, seed, device, batches=2), 4)])
+            model.train()
+            eval_sec += time.time() - te
     if device == "cuda":
         torch.cuda.synchronize()
-    sec = time.time() - t0
+    sec = time.time() - t0 - eval_sec
     model.eval()
-    eg = torch.Generator().manual_seed(10_000 + seed)
-    correct = total = 0
-    with torch.no_grad():
-        for _ in range(8):
-            x, y = mqar_batch(256, K, eg, device)
-            pred = model(x).argmax(-1)
-            m = y != -100
-            correct += int((pred[m] == y[m]).sum())
-            total += int(m.sum())
     return {
         "mixer": mixer,
+        "conv": conv,
+        "lr": lr,
         "K": K,
         "seed": seed,
         "steps": steps,
-        "accuracy": correct / total,
+        "accuracy": accuracy(model, K, seed, device),
+        "curve": curve,
         "final_loss": loss.item(),
         "ms_per_step": 1000 * sec / steps,
         "params": sum(p.numel() for p in model.parameters()),
@@ -84,9 +101,7 @@ def run(mixer, K, steps, device, bs=64, lr=1e-3, seed=0, d=128):
 
 def report(rows) -> str:
     Ks = sorted({r["K"] for r in rows})
-    mixers = [
-        m for m in ("softmax", "linear", "gated", "deltanet") if any(r["mixer"] == m for r in rows)
-    ]
+    mixers = list(dict.fromkeys(label(r) for r in rows))
     out = [
         "| mixer | " + " | ".join(f"K = {k}" for k in Ks) + " | ms / step |",
         "|---|" + "---|" * (len(Ks) + 1),
@@ -94,9 +109,9 @@ def report(rows) -> str:
     for m in mixers:
         cells = []
         for k in Ks:
-            accs = [r["accuracy"] for r in rows if r["mixer"] == m and r["K"] == k]
+            accs = [r["accuracy"] for r in rows if label(r) == m and r["K"] == k]
             cells.append(" / ".join(f"{100 * a:.1f}%" for a in accs) if accs else "—")
-        ms = [r["ms_per_step"] for r in rows if r["mixer"] == m]
+        ms = [r["ms_per_step"] for r in rows if label(r) == m]
         out.append(f"| {m} | " + " | ".join(cells) + f" | {sum(ms) / len(ms):.0f} |")
     return "\n".join(out) + "\n"
 
@@ -109,17 +124,22 @@ def main(argv=None):
     ap.add_argument("--Ks", default="16,32,64")
     ap.add_argument("--seeds", default="0,1")
     ap.add_argument("--steps", type=int, default=3000)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--conv", type=int, default=0, help="short conv width for recurrent mixers")
+    ap.add_argument("--softmax-conv", type=int, default=0, help="short conv width for softmax")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, "runs.jsonl")
     rows = [json.loads(s) for s in open(path)] if os.path.exists(path) else []
-    done = {(r["mixer"], r["K"], r["seed"]) for r in rows}
+    key = lambda r: (r["mixer"], r.get("conv", 0), r.get("lr", 1e-3), r["K"], r["seed"])  # noqa: E731
+    done = {key(r) for r in rows}
     for seed in map(int, a.seeds.split(",")):
         for K in map(int, a.Ks.split(",")):
             for m in a.mixers.split(","):
-                if (m, K, seed) in done:
+                conv = a.softmax_conv if m == "softmax" else a.conv
+                if (m, conv, a.lr, K, seed) in done:
                     continue
-                r = run(m, K, a.steps, a.device, seed=seed)
+                r = run(m, K, a.steps, a.device, lr=a.lr, seed=seed, conv=conv)
                 with open(path, "a") as f:
                     f.write(json.dumps(r) + "\n")
                 rows.append(r)
