@@ -126,6 +126,7 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--conv", type=int, default=0, help="short conv width for recurrent mixers")
+    ap.add_argument("--softmax-conv", type=int, default=0, help="short conv width for softmax")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, "runs.jsonl")
@@ -135,7 +136,7 @@ def main(argv=None):
     for seed in map(int, a.seeds.split(",")):
         for K in map(int, a.Ks.split(",")):
             for m in a.mixers.split(","):
-                conv = 0 if m == "softmax" else a.conv
+                conv = a.softmax_conv if m == "softmax" else a.conv
                 if (m, conv, a.lr, K, seed) in done:
                     continue
                 r = run(m, K, a.steps, a.device, lr=a.lr, seed=seed, conv=conv)
